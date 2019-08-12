@@ -2,8 +2,8 @@
 
 include ../Makefile.param
 
-SMP_SRCS := $(wildcard *.c)
-TARGET := $(SMP_SRCS:%.c=%)
+SMP_SRCS := $(wildcard *.cpp)
+TARGET := $(SMP_SRCS:%.cpp=%)
 
 TARGET_PATH := $(PWD)
 
