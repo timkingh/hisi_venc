@@ -31,6 +31,10 @@ typedef struct {
     HI_U8  *src_buf;
     FILE   *fp_raw;
     FILE   *fp_strm;
+    VIDEO_FRAME_INFO_S * src_frame; /* input frame info */
+    VB_POOL poolID;
+    HI_U32 phyYaddr; /* physical address of input frame */
+    HI_U8 *pVirYaddr; /* virtual address of input frame */
 } EncCtx;
 
 static void show_info(EncCtx *ctx)
@@ -41,10 +45,10 @@ static void show_info(EncCtx *ctx)
            "codec %s\n",
            ctx->in_file.c_str(), ctx->out_file.c_str(),
            ctx->width, ctx->height, ctx->frames,
-           (ctx->enc_mode == 0) ? "h264" : "h265");
+           (ctx->enc_mode == CODEC_AVC) ? "h264" : "h265");
 }
 
-static void yuv420to420sp(HI_U8 *src, HI_U8 *dst, HI_U32 width, HI_U32 height)
+static void yuv420p_to_yvu420sp(HI_U8 *src, HI_U8 *dst, HI_U32 width, HI_U32 height)
 {
     HI_U32 i, j;
     HI_U32 size = width * height;
@@ -111,7 +115,7 @@ HI_S32 venc_init(EncCtx *ctx)
     SAMPLE_PRT("enter\n");
 
     /******************************************
-     step  1: init sys variable
+    step  1: init sys variable
     ******************************************/
     VB_CONFIG_S stVbConf;
     HI_U32 u32BlkSize;
@@ -126,14 +130,14 @@ HI_S32 venc_init(EncCtx *ctx)
 
     stVbConf.u32MaxPoolCnt = 128;
     //u32BlkSize = SAMPLE_COMM_SYS_CalcPicVbBlkSize(gs_enNorm,\
-     //            enSize, SAMPLE_PIXEL_FORMAT, SAMPLE_SYS_ALIGN_WIDTH);
+    //            enSize, SAMPLE_PIXEL_FORMAT, SAMPLE_SYS_ALIGN_WIDTH);
 
     stVbConf.astCommPool[0].u64BlkSize = u32BlkSize = 1280 * 720 * 2;
     stVbConf.astCommPool[0].u32BlkCnt = 20;
     printf("--------blksize = %d----------------\n",u32BlkSize);
 
     /******************************************
-     step 2: mpp system init.
+    step 2: mpp system init.
     ******************************************/
     s32Ret = SAMPLE_COMM_SYS_Init(&stVbConf);
     if (HI_SUCCESS != s32Ret)
@@ -142,21 +146,28 @@ HI_S32 venc_init(EncCtx *ctx)
         goto exit;
     }
 
-     enRcMode = SAMPLE_RC_CBR;
-     enGopMode = VENC_GOPMODE_NORMALP;
-     s32Ret = SAMPLE_COMM_VENC_GetGopAttr(enGopMode,&stGopAttr);
-     if (HI_SUCCESS != s32Ret)
-     {
-         SAMPLE_PRT("Venc Get GopAttr for %#x!\n", s32Ret);
-         goto exit;
-     }
+    enRcMode = SAMPLE_RC_CBR;
+    enGopMode = VENC_GOPMODE_NORMALP;
+    s32Ret = SAMPLE_COMM_VENC_GetGopAttr(enGopMode,&stGopAttr);
+    if (HI_SUCCESS != s32Ret)
+    {
+        SAMPLE_PRT("Venc Get GopAttr for %#x!\n", s32Ret);
+        goto exit;
+    }
 
-     s32Ret = SAMPLE_COMM_VENC_Start(ctx->VencChn, enPayLoad,enSize, enRcMode,u32Profile,bRcnRefShareBuf,&stGopAttr);
-     if (HI_SUCCESS != s32Ret)
-     {
-         SAMPLE_PRT("Venc Start failed for %#x!\n", s32Ret);
-         goto exit;
-     }
+    s32Ret = SAMPLE_COMM_VENC_Start(ctx->VencChn, enPayLoad,enSize, enRcMode,u32Profile,bRcnRefShareBuf,&stGopAttr);
+    if (HI_SUCCESS != s32Ret)
+    {
+        SAMPLE_PRT("Venc Start failed for %#x!\n", s32Ret);
+        goto exit;
+    }
+
+    ctx->src_frame = (VIDEO_FRAME_INFO_S *)malloc(sizeof(VIDEO_FRAME_INFO_S));
+    if (ctx->src_frame == NULL) {
+        SAMPLE_PRT("malloc frame info failed\n");
+        s32Ret = HI_FAILURE;
+        goto exit;
+    }
 
 exit:
     return s32Ret;
@@ -168,8 +179,36 @@ HI_S32 venc_deinit(EncCtx *ctx)
     SAMPLE_PRT("enter\n");
     SAMPLE_COMM_VENC_Stop(ctx->VencChn);
     SAMPLE_COMM_SYS_Exit();
+    FREE(ctx->src_frame);
 
     return ret;
+}
+
+static void set_frame_info(EncCtx *ctx)
+{
+    VIDEO_FRAME_INFO_S *frame = ctx->src_frame;
+    HI_U32 width = ctx->width;
+    HI_U32 height = ctx->height;
+
+    memset(&(frame->stVFrame),0x00,sizeof(VIDEO_FRAME_S));
+    frame->stVFrame.u32Width = width;
+    frame->stVFrame.u32Height = height;
+    frame->stVFrame.enPixelFormat = PIXEL_FORMAT_YVU_SEMIPLANAR_420;
+    frame->u32PoolId = ctx->poolID;
+    frame->stVFrame.u64PhyAddr[0] = ctx->phyYaddr;
+    frame->stVFrame.u64PhyAddr[1] = ctx->phyYaddr + width * height;
+
+    frame->stVFrame.u64VirAddr[0] = (HI_U64)ctx->pVirYaddr;
+    frame->stVFrame.u64VirAddr[1] = (HI_U64)ctx->pVirYaddr + width * height;
+
+    frame->stVFrame.u32Stride[0] = width;
+    frame->stVFrame.u32Stride[1] = width;
+    frame->stVFrame.enField     = VIDEO_FIELD_FRAME;
+
+    frame->stVFrame.enCompressMode = COMPRESS_MODE_NONE;
+    frame->stVFrame.enVideoFormat  = VIDEO_FORMAT_LINEAR;
+    frame->stVFrame.u64PTS     = ctx->frame_cnt * 40;
+    frame->stVFrame.u32TimeRef = ctx->frame_cnt * 2;
 }
 
 HI_S32 venc_encode(EncCtx *ctx)
@@ -212,7 +251,6 @@ HI_S32 venc_encode(EncCtx *ctx)
     VB_BLK handleY = VB_INVALID_HANDLE;
     HI_U32 phyYaddr;
     HI_U8 *pVirYaddr;
-    VIDEO_FRAME_INFO_S *pstFrame = (VIDEO_FRAME_INFO_S *)malloc(sizeof(VIDEO_FRAME_INFO_S));
 
     /******************************************
      step 2:  Start to get streams of each channel.
@@ -229,7 +267,7 @@ HI_S32 venc_encode(EncCtx *ctx)
             goto exit;
         }
 
-        VB_POOL poolID = HI_MPI_VB_Handle2PoolId (handleY);
+        ctx->poolID = HI_MPI_VB_Handle2PoolId (handleY);
         phyYaddr = HI_MPI_VB_Handle2PhysAddr(handleY);
         if( phyYaddr == 0) {
             SAMPLE_PRT("HI_MPI_VB_Handle2PhysAddr for handleY failed\n");
@@ -238,27 +276,9 @@ HI_S32 venc_encode(EncCtx *ctx)
         }
 
         pVirYaddr = (HI_U8*) HI_MPI_SYS_Mmap(phyYaddr, width * height * 3 / 2);
-
-        memset(&(pstFrame->stVFrame),0x00,sizeof(VIDEO_FRAME_S));
-        pstFrame->stVFrame.u32Width = width;
-        pstFrame->stVFrame.u32Height = height;
-        pstFrame->stVFrame.enPixelFormat = PIXEL_FORMAT_YVU_SEMIPLANAR_420;
-        pstFrame->u32PoolId = poolID;
-        pstFrame->stVFrame.u64PhyAddr[0] = phyYaddr;
-        pstFrame->stVFrame.u64PhyAddr[1] = phyYaddr + width * height;
-
-        pstFrame->stVFrame.u64VirAddr[0] = (HI_U64)pVirYaddr;
-        pstFrame->stVFrame.u64VirAddr[1] = (HI_U64)pVirYaddr + width * height;
-
-        pstFrame->stVFrame.u32Stride[0] = width;
-        pstFrame->stVFrame.u32Stride[1] = width;
-        pstFrame->stVFrame.enField     = VIDEO_FIELD_FRAME;
-
-        pstFrame->stVFrame.enCompressMode = COMPRESS_MODE_NONE;
-        pstFrame->stVFrame.enVideoFormat  = VIDEO_FORMAT_LINEAR;
-        pstFrame->stVFrame.u64PTS     = frame * 40;
-        pstFrame->stVFrame.u32TimeRef = frame * 2;
-
+        ctx->phyYaddr = phyYaddr;
+        ctx->pVirYaddr = pVirYaddr;
+        set_frame_info(ctx);
 
         read_len = fread(ctx->src_buf, width * height * 3 / 2, 1, ctx->fp_raw);
         if(read_len < 0) {
@@ -271,9 +291,9 @@ HI_S32 venc_encode(EncCtx *ctx)
             continue;
         }
 
-        yuv420to420sp(ctx->src_buf, pVirYaddr, width, height);
+        yuv420p_to_yvu420sp(ctx->src_buf, pVirYaddr, width, height);
 
-        ret = HI_MPI_VENC_SendFrame(VencChn, pstFrame, 50);
+        ret = HI_MPI_VENC_SendFrame(VencChn, ctx->src_frame, 50);
         if(ret != HI_SUCCESS) {
             SAMPLE_PRT("HI_MPI_VENC_SendFrame failed 0x%08x\n",ret);
             goto exit;
@@ -368,16 +388,15 @@ HI_S32 venc_encode(EncCtx *ctx)
             }
         }
 
-        SAMPLE_PRT("encode frame :%d\n", frame++);
-        if(frame >= ctx->frames) {
+        SAMPLE_PRT("encode frame :%d\n", ctx->frame_cnt++);
+        if(ctx->frame_cnt >= ctx->frames) {
             eos = 1;
             SAMPLE_PRT("encode get eos.\n");
         }
     }
 
 exit:
-    FREE(pstFrame);
-    SAMPLE_PRT("success to encode %d frames\n", frame);
+    SAMPLE_PRT("finish encoding %d frames\n", ctx->frame_cnt);
     return ret;
 }
 
@@ -392,7 +411,7 @@ int main(int argc, char **argv)
     ctx->width = getarg(1280, "-w", "--width");
     ctx->height = getarg(720, "-h", "--height");
     ctx->frames = getarg(3, "-f", "--frames");
-    ctx->enc_mode = CODEC_HEVC;
+    ctx->enc_mode = (EncMode)getarg(1, "-m", "--mode");
 
     show_info(ctx);
 
