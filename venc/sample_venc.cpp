@@ -32,6 +32,7 @@ typedef struct {
     FILE   *fp_raw;
     FILE   *fp_strm;
     VIDEO_FRAME_INFO_S * src_frame; /* input frame info */
+    VB_BLK handleY;
     VB_POOL poolID;
     HI_U32 phyYaddr; /* physical address of input frame */
     HI_U8 *pVirYaddr; /* virtual address of input frame */
@@ -41,7 +42,7 @@ static void show_info(EncCtx *ctx)
 {
     printf("input %s\n"
            "output %s\n"
-           "width %d height %d frames %d\n"
+           "width %d\n height %d\n frames %d\n"
            "codec %s\n",
            ctx->in_file.c_str(), ctx->out_file.c_str(),
            ctx->width, ctx->height, ctx->frames,
@@ -72,6 +73,7 @@ HI_S32 sample_init(EncCtx *ctx)
 {
     HI_S32 ret = HI_SUCCESS;
     ctx->VencChn = 0;
+    ctx->frame_cnt = 0;
 
     ctx->fp_raw = fopen(ctx->in_file.c_str(), "rb");
     if (ctx->fp_raw == NULL) {
@@ -142,7 +144,7 @@ HI_S32 venc_init(EncCtx *ctx)
     s32Ret = SAMPLE_COMM_SYS_Init(&stVbConf);
     if (HI_SUCCESS != s32Ret)
     {
-        SAMPLE_PRT("system init failed with %d!\n", s32Ret);
+        SAMPLE_PRT("system init failed with %#x!\n", s32Ret);
         goto exit;
     }
 
@@ -169,6 +171,28 @@ HI_S32 venc_init(EncCtx *ctx)
         goto exit;
     }
 
+    ctx->handleY = HI_MPI_VB_GetBlock(VB_INVALID_POOLID, ctx->width * ctx->height * 3 / 2, NULL);
+    if (ctx->handleY == VB_INVALID_HANDLE) {
+        SAMPLE_PRT("getblock for input frame failed\n");
+        s32Ret = HI_FAILURE;
+        goto exit;
+    }
+
+    ctx->poolID = HI_MPI_VB_Handle2PoolId (ctx->handleY);
+    ctx->phyYaddr = HI_MPI_VB_Handle2PhysAddr(ctx->handleY);
+    if(ctx->phyYaddr == 0) {
+        SAMPLE_PRT("HI_MPI_VB_Handle2PhysAddr for handleY failed\n");
+        s32Ret = HI_FAILURE;
+        goto exit;
+    }
+
+    ctx->pVirYaddr = (HI_U8*) HI_MPI_SYS_Mmap(ctx->phyYaddr, ctx->width * ctx->height * 3 / 2);
+    if (ctx->pVirYaddr == 0) {
+        SAMPLE_PRT("HI_MPI_SYS_Mmap for handleY failed\n");
+        s32Ret = HI_FAILURE;
+        goto exit;
+    }
+
 exit:
     return s32Ret;
 }
@@ -177,6 +201,11 @@ HI_S32 venc_deinit(EncCtx *ctx)
 {
     HI_S32 ret = HI_SUCCESS;
     SAMPLE_PRT("enter\n");
+
+    HI_MPI_SYS_Munmap(ctx->pVirYaddr, ctx->width * ctx->height * 3 / 2);
+    HI_MPI_VB_ReleaseBlock(ctx->handleY);
+    ctx->handleY = VB_INVALID_HANDLE;
+
     SAMPLE_COMM_VENC_Stop(ctx->VencChn);
     SAMPLE_COMM_SYS_Exit();
     FREE(ctx->src_frame);
@@ -215,69 +244,27 @@ HI_S32 venc_encode(EncCtx *ctx)
 {
     SAMPLE_PRT("enter\n");
     HI_S32 ret = HI_SUCCESS;
-    HI_S32 i;
-    VENC_CHN_ATTR_S stVencChnAttr;
-    SAMPLE_VENC_GETSTREAM_PARA_S* pstPara;
-    HI_S32 maxfd = 0;
     struct timeval TimeoutVal;
     fd_set read_fds;
     HI_S32 VencFd;
     VENC_CHN_STATUS_S stStat;
     VENC_STREAM_S stStream;
-    HI_S32 s32Ret ,frame = 0, eos = 0;
+    HI_S32 s32Ret , eos = 0;
     VENC_CHN VencChn = ctx->VencChn;
-    PAYLOAD_TYPE_E enPayLoadType;
     HI_U32 width = ctx->width;
     HI_U32 height = ctx->height;
     HI_U32 read_len;
 
-    if(ctx->enc_mode == CODEC_AVC)
-        enPayLoadType = PT_H264;
-    else if(ctx->enc_mode == CODEC_HEVC)
-        enPayLoadType = PT_H265;
-    else
-    {
-        SAMPLE_PRT("unknown payload type\n");
-        return HI_FAILURE;
-    }
-
     VencFd = HI_MPI_VENC_GetFd(VencChn);
-    if (VencFd < 0)
-    {
+    if (VencFd < 0) {
         SAMPLE_PRT("HI_MPI_VENC_GetFd failed with %#x!\n",VencFd);
         return HI_FAILURE;
     }
 
-    VB_BLK handleY = VB_INVALID_HANDLE;
-    HI_U32 phyYaddr;
-    HI_U8 *pVirYaddr;
-
     /******************************************
-     step 2:  Start to get streams of each channel.
+     step 2:  send frame and get stream
     ******************************************/
-    while (!eos)
-    {
-        do {
-            handleY = HI_MPI_VB_GetBlock(VB_INVALID_POOLID, width * height * 3 / 2, NULL);
-        } while (VB_INVALID_HANDLE == handleY);
-
-        if(handleY == VB_INVALID_HANDLE) {
-            SAMPLE_PRT("getblock for y failed\n");
-            ret = HI_FAILURE;
-            goto exit;
-        }
-
-        ctx->poolID = HI_MPI_VB_Handle2PoolId (handleY);
-        phyYaddr = HI_MPI_VB_Handle2PhysAddr(handleY);
-        if( phyYaddr == 0) {
-            SAMPLE_PRT("HI_MPI_VB_Handle2PhysAddr for handleY failed\n");
-            ret = HI_FAILURE;
-            goto exit;
-        }
-
-        pVirYaddr = (HI_U8*) HI_MPI_SYS_Mmap(phyYaddr, width * height * 3 / 2);
-        ctx->phyYaddr = phyYaddr;
-        ctx->pVirYaddr = pVirYaddr;
+    while (!eos) {
         set_frame_info(ctx);
 
         read_len = fread(ctx->src_buf, width * height * 3 / 2, 1, ctx->fp_raw);
@@ -291,7 +278,7 @@ HI_S32 venc_encode(EncCtx *ctx)
             continue;
         }
 
-        yuv420p_to_yvu420sp(ctx->src_buf, pVirYaddr, width, height);
+        yuv420p_to_yvu420sp(ctx->src_buf, ctx->pVirYaddr, width, height);
 
         ret = HI_MPI_VENC_SendFrame(VencChn, ctx->src_frame, 50);
         if(ret != HI_SUCCESS) {
@@ -381,10 +368,6 @@ HI_S32 venc_encode(EncCtx *ctx)
                  step 2.7 : free pack nodes
                 *******************************************************/
                 FREE(stStream.pstPack);
-
-                HI_MPI_SYS_Munmap(pVirYaddr, width * height * 3 / 2);
-                HI_MPI_VB_ReleaseBlock(handleY);
-                handleY = VB_INVALID_HANDLE;
             }
         }
 
@@ -405,7 +388,6 @@ int main(int argc, char **argv)
     HI_S32 ret = HI_SUCCESS;
     EncCtx enc_ctx;
     EncCtx *ctx = &enc_ctx;
-    bool help = getarg(false, "-H", "--help", "-?");
     ctx->in_file = getarg("F:\\rkvenc_verify\\input_yuv\\3903_720x576.yuv", "-i", "--input");
     ctx->out_file = getarg("F:\\rkvenc_verify\\input_yuv\\3903_720x576_hi_rk.yuv", "-o", "--output");
     ctx->width = getarg(1280, "-w", "--width");
@@ -413,6 +395,10 @@ int main(int argc, char **argv)
     ctx->frames = getarg(3, "-f", "--frames");
     ctx->enc_mode = (EncMode)getarg(1, "-m", "--mode");
 
+    if (argc < 2) {
+        SAMPLE_PRT("Usage: ./sample_venc -i input.yuv -w=1280 -h=720 --frames=3 -m 1 -o out.bin");
+        return 0;
+    }
     show_info(ctx);
 
     ret = sample_init(ctx);
